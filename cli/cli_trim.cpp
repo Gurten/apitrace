@@ -26,17 +26,331 @@
 
 #include <set>
 #include <sstream>
+#include <memory>
+#include <map>
+#include <type_traits>
 #include <string.h>
 #include <limits.h> // for CHAR_MAX
 #include <getopt.h>
+
 
 #include "cli.hpp"
 
 #include "os_string.hpp"
 
+#include "d3d9imports.hpp"
+#include "d3d9size.hpp"
+
 #include "trace_callset.hpp"
 #include "trace_parser.hpp"
 #include "trace_writer.hpp"
+
+
+//TODO: Find new home
+enum class ResourceType
+{
+    Unknown = 0,
+    Texture,
+};
+
+enum class ResourceAction
+{
+    Unknown = 0,
+    TextureLock,
+    Memcpy,
+    TextureUnlock,
+};
+
+
+
+
+class D3D9StateAggregator //TODO: extract interface
+{
+public:
+    enum class CallCode
+    {
+        retrace_memcpy = 0,
+        retrace_IUnknown__AddRef = 19 ,
+        retrace_IUnknown__Release = 20 ,
+        retrace_IUnknown__Release2 = 64 ,
+        retrace_IUnknown__Release3 = 317,
+
+        retrace_IUnknown__QueryInterface = 196,
+
+        retrace_IDirect3DTexture9__GetSurfaceLevel = 80 ,
+
+        retrace_IDirect3DTexture9__LockRect=  81 ,
+        retrace_IDirect3DTexture9__UnlockRect = 82 ,
+
+        retrace_IDirect3DVertexBuffer9__Lock = 150,
+        retrace_IDirect3DVertexBuffer9__Unlock = 151,
+
+        retrace_IDirect3DDevice9__TestCooperativeLevel=  199,
+        retrace_IDirect3DDevice9__GetDirect3D=  202,
+        retrace_IDirect3DDevice9__Present = 213,
+        retrace_IDirect3DDevice9__CreateTexture=  219,
+
+
+        retrace_IDirect3DDevice9__CreateVertexBuffer = 222,
+        retrace_IDirect3DDevice9__SetViewport = 243,
+        retrace_IDirect3DDevice9__SetRenderState = 253,
+        retrace_IDirect3DDevice9__SetTexture = 261,
+        retrace_IDirect3DDevice9__SetSamplerState = 265,
+        retrace_IDirect3DDevice9__CreateVertexDeclaration = 282,
+        retrace_IDirect3DDevice9__SetVertexDeclaration = 283,
+        retrace_IDirect3DDevice9__CreateVertexShader = 287,
+        retrace_IDirect3DDevice9__SetVertexShader = 288,
+        retrace_IDirect3DDevice9__SetVertexShaderConstantF = 290,
+        retrace_IDirect3DDevice9__SetStreamSource = 296,
+        retrace_IDirect3DDevice9__CreatePixelShader = 302,
+        retrace_IDirect3DDevice9__SetPixelShader = 303,
+        retrace_IDirect3DDevice9__SetPixelShaderConstantF = 305,
+        retrace_IDirect3D9__CreateDevice = 331,
+        retrace_Direct3DCreate9 = 559,
+
+    };
+
+    struct MappedRegion
+    {
+        size_t size = 0;
+        uint32_t resource = 0;
+    };
+
+private:
+
+
+    class Resource
+    {
+    public: 
+        Resource(std::unique_ptr<trace::Call> && call,
+            std::map<uint32_t, MappedRegion> *activeRegions,
+            ResourceType resourceType = ResourceType::Unknown)
+            : creation(std::move(call))
+            , activeRegions_(activeRegions)
+            , resourceType_(resourceType) {}
+
+        void addRef()
+        {
+            refcountCheck();
+
+            ref_count_++;
+        }
+
+        void release()
+        {
+            refcountCheck();
+            ref_count_--;
+        }
+
+        void addCall(std::unique_ptr<trace::Call> && call, ResourceAction resourceAction)
+        {
+            switch (resourceType_)
+            {
+            case ResourceType::Texture:
+                handleCallAsTexture(std::move(call), resourceAction);
+                break;
+
+            default:
+                std::cerr << "unsupported resource" << std::endl;
+            
+            }
+        }
+
+        std::vector< std::shared_ptr<trace::Call>> flatten() {
+            std::vector< std::shared_ptr<trace::Call>> result;
+            
+            refcountCheck();
+
+            if(ref_count_ <= 0)
+            { 
+                return {};
+            }
+
+            result.emplace_back(creation);
+
+            for (auto& m : modifiers_)
+            {
+                result.insert(result.end(), m.second.begin(), m.second.end() );
+            }
+
+            return result;
+        }
+
+    private:
+        void refcountCheck()
+        {
+            if (ref_count_ <= 0)
+            {
+                std::cerr << "invalid resource refcount encountered: 0x" 
+                    << std::hex << creation->arg(7).toUInt() << std::dec << std::endl;
+            }
+        }
+
+        void handleCallAsTexture(std::unique_ptr<trace::Call> && call, ResourceAction resourceAction)
+        {
+            switch (resourceAction)
+            {
+            case ResourceAction::TextureLock:
+            {
+                ++memory_mapped_region_count_;
+                uint32_t subresource_index = (call->arg(1)).toUInt();
+                auto sub_staging = staging_modifiers_.find(subresource_index);
+
+                if (sub_staging != staging_modifiers_.cend()) {
+                    if (sub_staging->second.size() > 0)
+                    {
+                        std::cerr << "throwing away texture operations" << std::endl;
+                    }
+                    sub_staging->second = { std::shared_ptr(std::move(call)) };
+                }
+                else
+                {  
+                    staging_modifiers_.emplace(subresource_index,
+                        std::vector<std::shared_ptr<trace::Call>>({ std::shared_ptr(std::move(call)) }));
+                }
+
+                activeRegions_;
+
+
+                break;
+            }
+                
+            case ResourceAction::Memcpy:
+            {
+                //TODO: verify memcpy
+                uint32_t subresource_index = (call->arg(1)).toUInt();
+                auto sub_staging = staging_modifiers_.find(subresource_index);
+
+                if (sub_staging != staging_modifiers_.cend()) {
+                    sub_staging->second.emplace_back(std::move(call));
+                }
+                else
+                {
+                    std::cerr << "memcpy for unmapped region" << std::endl;
+                }
+                break;
+            }
+            case ResourceAction::TextureUnlock:
+                --memory_mapped_region_count_;
+                break;
+
+            default:
+                std::cerr << "unsupported resource action" << std::endl;
+            }
+        }
+
+
+        int ref_count_ = 1;
+
+        int memory_mapped_region_count_ = 0;
+        ResourceType resourceType_;
+        std::shared_ptr < trace::Call> creation;
+
+        //subresource id to vector of modifying calls.
+        std::map<uint32_t, std::vector< std::shared_ptr<trace::Call>>> modifiers_;
+
+        std::map<uint32_t, std::vector< std::shared_ptr<trace::Call>>> staging_modifiers_;
+
+        //
+        std::map<uint32_t, MappedRegion> const *activeRegions_;
+    };
+
+public:
+    
+
+    D3D9StateAggregator() {}
+
+    void addCall(std::unique_ptr<trace::Call> && call) {
+        CallCode const call_code = static_cast<CallCode>(call->sig->id);
+        switch (call_code)
+        {
+        
+        case CallCode::retrace_memcpy           :
+        case CallCode::retrace_IUnknown__AddRef :
+        case CallCode::retrace_IUnknown__Release:
+        case CallCode::retrace_IUnknown__Release2:
+        case CallCode::retrace_IUnknown__Release3:
+
+        case CallCode::retrace_IUnknown__QueryInterface:
+
+        case CallCode::retrace_IDirect3DTexture9__GetSurfaceLevel:
+
+        case CallCode::retrace_IDirect3DTexture9__LockRect:
+        {
+            auto it = resources_.find(call->arg(0).toUInt());
+            if (it != resources_.cend())
+            {
+                it->second.addCall(std::move(call), ResourceAction::TextureLock);
+            }
+            else
+            {
+                std::cerr << "ERROR: trying to lock nonexistant texture." << std::endl;
+            }
+            break;
+        }
+        case CallCode::retrace_IDirect3DTexture9__UnlockRect:
+            return; //Possibly have better lineage control for this
+        case CallCode::retrace_IDirect3DVertexBuffer9__Lock:
+        case CallCode::retrace_IDirect3DVertexBuffer9__Unlock:
+        
+        case CallCode::retrace_IDirect3DDevice9__TestCooperativeLevel:
+        case CallCode::retrace_IDirect3DDevice9__GetDirect3D:
+        case CallCode::retrace_IDirect3DDevice9__Present:
+        case CallCode::retrace_IDirect3DDevice9__CreateTexture:
+        {
+            auto[_, success_inserted] = resources_.emplace(call->arg(7).toUInt(), 
+                Resource(std::move(call), &activeRegions_,  ResourceType::Texture));
+            if (!success_inserted)
+            {
+                std::cerr << "ERROR: texture already created." << std::endl;
+            }
+            break;
+        }
+        case CallCode::retrace_IDirect3DDevice9__CreateVertexBuffer     :
+        case CallCode::retrace_IDirect3DDevice9__SetViewport            :
+        case CallCode::retrace_IDirect3DDevice9__SetRenderState         :
+        case CallCode::retrace_IDirect3DDevice9__SetTexture             :
+        case CallCode::retrace_IDirect3DDevice9__SetSamplerState        :
+        case CallCode::retrace_IDirect3DDevice9__CreateVertexDeclaration:
+        case CallCode::retrace_IDirect3DDevice9__SetVertexDeclaration   :
+        case CallCode::retrace_IDirect3DDevice9__CreateVertexShader     :
+        case CallCode::retrace_IDirect3DDevice9__SetVertexShader        :
+        case CallCode::retrace_IDirect3DDevice9__SetVertexShaderConstantF:
+        case CallCode::retrace_IDirect3DDevice9__SetStreamSource        :
+        case CallCode::retrace_IDirect3DDevice9__CreatePixelShader      :
+        case CallCode::retrace_IDirect3DDevice9__SetPixelShader         :
+        case CallCode::retrace_IDirect3DDevice9__SetPixelShaderConstantF:
+        
+        case CallCode::retrace_IDirect3D9__CreateDevice:
+        case CallCode::retrace_Direct3DCreate9:
+
+        
+        default:
+            break;
+        }
+    
+    }
+
+    std::vector< std::shared_ptr<trace::Call>> getSquashedCalls() { return {}; }
+
+private:
+    std::map<uint32_t, Resource> resources_;
+
+    std::map<uint32_t, MappedRegion> activeRegions_;
+};
+
+
+//==========================================^Find new home ^====================
+
+
+
+
+
+
+
+
+
+
 
 static const char *synopsis = "Create a new trace by trimming an existing trace.";
 
@@ -58,7 +372,9 @@ usage(void)
 enum {
     CALLS_OPT = CHAR_MAX + 1,
     FRAMES_OPT,
-    THREAD_OPT
+    THREAD_OPT,
+    SQUASH_OPT,
+
 };
 
 const static char *
@@ -70,6 +386,7 @@ longOptions[] = {
     {"calls", required_argument, 0, CALLS_OPT},
     {"frames", required_argument, 0, FRAMES_OPT},
     {"thread", required_argument, 0, THREAD_OPT},
+    {"squash-until-frame", required_argument, 0, SQUASH_OPT},
     {"output", required_argument, 0, 'o'},
     {0, 0, 0, 0}
 };
@@ -89,6 +406,10 @@ struct trim_options {
 
     /* Output filename */
     std::string output;
+
+    /*Attempt to follow lineage of resource updates for individual resources 
+     until this frame*/
+    unsigned int squash_until_frame;
 
     /* Emit only calls from this thread (empty == all threads) */
     std::set<unsigned> threadIds;
@@ -119,17 +440,43 @@ trim_trace(const char *filename, struct trim_options *options)
         return 1;
     }
 
+    //TODO: get the api name/version from the file p. Only planned support for D3D9.
+    D3D9StateAggregator state_aggregator;
 
     frame = 0;
-    trace::Call *call;
-    while ((call = p.parse_call())) {
+    std::unique_ptr<trace::Call> call;
+
+
+    const unsigned int squash_until_frame = options->squash_until_frame;
+    
+    while (frame < squash_until_frame) {
+        call = std::unique_ptr<trace::Call>(p.parse_call());
+        if (!call)
+        {
+            break;
+        }
+        
+        trace::CallFlags const& call_flags = call->flags;
+        state_aggregator.addCall(std::move(call));
+        if (call_flags & trace::CALL_FLAG_END_FRAME) {
+            frame++;
+        }
+    }
+
+    for (auto& squash_call : state_aggregator.getSquashedCalls())
+    {
+        writer.writeCall(squash_call.get());
+    }
+
+
+    while ((call = std::unique_ptr<trace::Call>(p.parse_call()))) {
+        trace::CallFlags const& call_flags = call->flags;
 
         /* There's no use doing any work past the last call and frame
          * requested by the user. */
         if ((options->calls.empty() || call->no > options->calls.getLast()) &&
             (options->frames.empty() || frame > options->frames.getLast())) {
 
-            delete call;
             break;
         }
 
@@ -143,17 +490,16 @@ trim_trace(const char *filename, struct trim_options *options)
          * then require it (and all dependencies) in the trimmed
          * output. */
         if (options->calls.contains(*call) ||
-            options->frames.contains(frame, call->flags)) {
+            options->frames.contains(frame, call_flags)) {
 
-            writer.writeCall(call);
+            writer.writeCall(call.get());
         }
 
     NEXT:
-        if (call->flags & trace::CALL_FLAG_END_FRAME) {
+        if (call_flags & trace::CALL_FLAG_END_FRAME) {
             frame++;
         }
 
-        delete call;
     }
 
     std::cerr << "Trimmed trace is available as " << options->output << "\n";
@@ -180,6 +526,9 @@ command(int argc, char *argv[])
             break;
         case FRAMES_OPT:
             options.frames.merge(optarg);
+            break;
+        case SQUASH_OPT:
+            options.squash_until_frame = atoi(optarg);
             break;
         case THREAD_OPT:
             options.threadIds.insert(atoi(optarg));

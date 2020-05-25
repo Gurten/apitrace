@@ -194,13 +194,13 @@ int execute(char * const * args)
     startupInfo.cb = sizeof(startupInfo);
 
     PROCESS_INFORMATION processInformation;
-
+    log("Creating process suspended.\n");
     if (!CreateProcessA(NULL,
                         const_cast<char *>(commandLine.c_str()), // only modified by CreateProcessW
                         0, // process attributes
                         0, // thread attributes
                         FALSE, // inherit handles
-                        0, // creation flags,
+                        CREATE_SUSPENDED, // creation flags,
                         NULL, // environment
                         NULL, // current directory
                         &startupInfo,

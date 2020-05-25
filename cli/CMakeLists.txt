@@ -17,6 +17,8 @@ endif ()
 include_directories (
     ${CMAKE_SOURCE_DIR}/lib/highlight
     ${CMAKE_SOURCE_DIR}/thirdparty
+    ${CMAKE_SOURCE_DIR}/helpers
+    ${CMAKE_SOURCE_DIR}/dispatch
 )
 
 add_executable (apitrace
