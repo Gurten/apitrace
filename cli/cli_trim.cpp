@@ -26,6 +26,8 @@
 
 #include <set>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <memory>
 #include <map>
 #include <type_traits>
@@ -38,6 +40,7 @@
 
 #include "os_string.hpp"
 
+#include "retrace.hpp"
 #include "d3d9imports.hpp"
 #include "d3d9size.hpp"
 
@@ -56,13 +59,18 @@ enum class ResourceType
 enum class ResourceAction
 {
     Unknown = 0,
-    TextureLock,
     Memcpy,
+    TextureLock,
     TextureUnlock,
+
 };
 
 
-
+static bool endsWith(std::string_view str, std::string_view ending)
+{
+    return str.length() >= ending.length() 
+        && str.substr(str.length()-ending.length()).compare(ending) ==0;
+}
 
 class D3D9StateAggregator //TODO: extract interface
 {
@@ -70,27 +78,20 @@ public:
     enum class CallCode
     {
         retrace_memcpy = 0,
-        retrace_IUnknown__AddRef = 19 ,
-        retrace_IUnknown__Release = 20 ,
-        retrace_IUnknown__Release2 = 64 ,
+        retrace_IUnknown__AddRef = 19,
+        retrace_IUnknown__Release = 20,
+        retrace_IUnknown__Release2 = 64,
         retrace_IUnknown__Release3 = 317,
-
         retrace_IUnknown__QueryInterface = 196,
-
-        retrace_IDirect3DTexture9__GetSurfaceLevel = 80 ,
-
-        retrace_IDirect3DTexture9__LockRect=  81 ,
-        retrace_IDirect3DTexture9__UnlockRect = 82 ,
-
+        retrace_IDirect3DTexture9__GetSurfaceLevel = 80,
+        retrace_IDirect3DTexture9__LockRect=  81,
+        retrace_IDirect3DTexture9__UnlockRect = 82,
         retrace_IDirect3DVertexBuffer9__Lock = 150,
         retrace_IDirect3DVertexBuffer9__Unlock = 151,
-
         retrace_IDirect3DDevice9__TestCooperativeLevel=  199,
         retrace_IDirect3DDevice9__GetDirect3D=  202,
         retrace_IDirect3DDevice9__Present = 213,
         retrace_IDirect3DDevice9__CreateTexture=  219,
-
-
         retrace_IDirect3DDevice9__CreateVertexBuffer = 222,
         retrace_IDirect3DDevice9__SetViewport = 243,
         retrace_IDirect3DDevice9__SetRenderState = 253,
@@ -112,20 +113,35 @@ public:
 
     struct MappedRegion
     {
+        //The address of the mapped region
+        size_t base = 0;
+
+        // The size of the mapped region
         size_t size = 0;
-        uint32_t resource = 0;
+        
+        //The resource which memory-mapped this region
+        size_t parentResource = 0;
+
+        //The subresource which memory-mapped this region
+        //I.e a sub-texture 
+        size_t parentSubresource = 0;
+
+        bool containOther(size_t otherBase, size_t otherSize) const
+        {
+            return otherBase >= base && (otherBase+otherSize) <= (base+size);
+        }
     };
 
+
+
 private:
-
-
     class Resource
     {
     public: 
         Resource(std::unique_ptr<trace::Call> && call,
-            std::map<uint32_t, MappedRegion> *activeRegions,
+            std::map<size_t, MappedRegion> *activeRegions,
             ResourceType resourceType = ResourceType::Unknown)
-            : creation(std::move(call))
+            : creation_(std::move(call))
             , activeRegions_(activeRegions)
             , resourceType_(resourceType) {}
 
@@ -166,7 +182,7 @@ private:
                 return {};
             }
 
-            result.emplace_back(creation);
+            result.emplace_back(creation_);
 
             for (auto& m : modifiers_)
             {
@@ -177,13 +193,68 @@ private:
         }
 
     private:
+
+        //Gets the resource address from the argument accompanying the resource-
+        // creation call. 
+        size_t getResourceAddress()
+        {
+            switch (resourceType_)
+            {
+            case ResourceType::Texture:
+                return static_cast<size_t>(creation_->arg(7).toUInt());
+            
+            default:
+                std::cerr << "invalid resource type" << std::endl;
+                return 0;
+            }
+        }
+
         void refcountCheck()
         {
             if (ref_count_ <= 0)
             {
                 std::cerr << "invalid resource refcount encountered: 0x" 
-                    << std::hex << creation->arg(7).toUInt() << std::dec << std::endl;
+                    << std::hex << getResourceAddress() << std::dec << std::endl;
             }
+        }
+
+        MappedRegion textureGetMappedRegionDescriptor(
+            trace::Call * textureLockCall)
+        {
+            retrace::ScopedAllocator _allocator;
+            D3DLOCKED_RECT * pLockedRect;
+            pLockedRect = _allocator.allocArray<D3DLOCKED_RECT>(&textureLockCall->arg(2));
+
+            //  \retrace\d3dretrace_d3d9.cpp:1039
+            RECT * pRect;
+            pRect = _allocator.allocArray<RECT>(&textureLockCall->arg(3));
+            if (pRect) {
+                const trace::Array *_a_PRECT5_0 = (textureLockCall->arg(3)).toArray();
+                const trace::Struct *_s_RECT_1 = (*_a_PRECT5_0->values[0]).toStruct();
+                assert(_s_RECT_1);
+                (pRect[0]).left = (*_s_RECT_1->members[0]).toSInt();
+                (pRect[0]).top = (*_s_RECT_1->members[1]).toSInt();
+                (pRect[0]).right = (*_s_RECT_1->members[2]).toSInt();
+                (pRect[0]).bottom = (*_s_RECT_1->members[3]).toSInt();
+            }
+
+            UINT Width;
+            UINT Height;
+            D3DFORMAT Format;
+            Format = static_cast<D3DFORMAT>((creation_->arg(5)).toSInt());
+            if (pRect) {
+                Width = pRect->right - pRect->left;
+                Height = pRect->bottom - pRect->top;
+            }
+            else {
+                Width = (creation_->arg(1)).toUInt();
+                Height = (creation_->arg(2)).toUInt();
+            }
+
+            size_t size = _getLockSize(Format, pRect, Width, Height, pLockedRect->Pitch);
+            return MappedRegion{ reinterpret_cast<size_t>(pLockedRect->pBits),   
+                size,  static_cast<size_t>(textureLockCall->arg(0).toUInt()), 
+                static_cast<size_t>(textureLockCall->arg(1).toUInt()) };
         }
 
         void handleCallAsTexture(std::unique_ptr<trace::Call> && call, ResourceAction resourceAction)
@@ -193,7 +264,8 @@ private:
             case ResourceAction::TextureLock:
             {
                 ++memory_mapped_region_count_;
-                uint32_t subresource_index = (call->arg(1)).toUInt();
+                MappedRegion mappedRegion = textureGetMappedRegionDescriptor(call.get());
+                size_t subresource_index = (call->arg(1)).toUInt();
                 auto sub_staging = staging_modifiers_.find(subresource_index);
 
                 if (sub_staging != staging_modifiers_.cend()) {
@@ -209,17 +281,30 @@ private:
                         std::vector<std::shared_ptr<trace::Call>>({ std::shared_ptr(std::move(call)) }));
                 }
 
-                activeRegions_;
-
-
+                auto[_, success_inserted] = activeRegions_->emplace(mappedRegion.base, mappedRegion);
+                if (!success_inserted)
+                {
+                    std::cerr << "ERROR: texture was already locked" << std::endl;
+                }
                 break;
             }
                 
             case ResourceAction::Memcpy:
             {
-                //TODO: verify memcpy
-                uint32_t subresource_index = (call->arg(1)).toUInt();
-                auto sub_staging = staging_modifiers_.find(subresource_index);
+                size_t destination = static_cast<size_t>(call->arg(0).toUInt());
+                size_t length = static_cast<size_t>(call->arg(1).toUInt());
+                auto it = activeRegions_->lower_bound(destination);
+                if (it == activeRegions_->cend() 
+                    || !it->second.containOther(destination, length))
+                {
+                    std::cerr << "ERROR: no regions matched" << std::endl;
+                    break;
+                }
+
+                MappedRegion const& region = it->second;
+                assert(region.parentResource == getResourceAddress()); //"memcpy resource mismatch"
+
+                auto sub_staging = staging_modifiers_.find(region.parentSubresource);
 
                 if (sub_staging != staging_modifiers_.cend()) {
                     sub_staging->second.emplace_back(std::move(call));
@@ -231,9 +316,48 @@ private:
                 break;
             }
             case ResourceAction::TextureUnlock:
+            {
                 --memory_mapped_region_count_;
+
+                size_t subresource_index = (call->arg(1)).toUInt();
+                auto sub_staging = staging_modifiers_.find(subresource_index);
+
+                if (sub_staging != staging_modifiers_.cend()) {
+                    std::vector< std::shared_ptr<trace::Call>> &staging = sub_staging->second;
+
+                    if (staging.size() < 1
+                        || !endsWith(staging[0]->sig->name, "LockRect"))
+                    {
+                        std::cerr << "ERROR: insufficient information to unmap" << std::endl;
+                        break;
+                    }
+
+                    MappedRegion regionDesc = textureGetMappedRegionDescriptor(staging[0].get());
+                    auto it = activeRegions_->lower_bound(regionDesc.base);
+                    if (it == activeRegions_->cend()
+                        || !it->second.containOther(regionDesc.base, regionDesc.size))
+                    {
+                        std::cerr << "ERROR: no regions matched" << std::endl;
+                        break;
+                    }
+
+                    activeRegions_->erase(it);
+                    staging.emplace_back(std::move(call));
+
+                    //Move it into the complete modifiers for this resource
+                    modifiers_[subresource_index] = std::move(staging);
+                    staging = {};
+                }
+                else
+                {
+                    std::cerr << "unlocking a resource never locked." << std::endl;
+                    staging_modifiers_.emplace(subresource_index,
+                        std::vector<std::shared_ptr<trace::Call>>({ std::shared_ptr(std::move(call)) }));
+                }
+
                 break;
 
+            }
             default:
                 std::cerr << "unsupported resource action" << std::endl;
             }
@@ -243,16 +367,16 @@ private:
         int ref_count_ = 1;
 
         int memory_mapped_region_count_ = 0;
-        ResourceType resourceType_;
-        std::shared_ptr < trace::Call> creation;
+        ResourceType const resourceType_;
+        std::shared_ptr < trace::Call> const creation_;
 
         //subresource id to vector of modifying calls.
-        std::map<uint32_t, std::vector< std::shared_ptr<trace::Call>>> modifiers_;
+        std::map<size_t, std::vector< std::shared_ptr<trace::Call>>> modifiers_;
 
-        std::map<uint32_t, std::vector< std::shared_ptr<trace::Call>>> staging_modifiers_;
+        std::map<size_t, std::vector< std::shared_ptr<trace::Call>>> staging_modifiers_;
 
         //
-        std::map<uint32_t, MappedRegion> const *activeRegions_;
+        std::map<size_t, MappedRegion>  * const activeRegions_;
     };
 
 public:
@@ -264,8 +388,30 @@ public:
         CallCode const call_code = static_cast<CallCode>(call->sig->id);
         switch (call_code)
         {
-        
+        //TODO: revise the call-codes. They might not be consistent between different files.
         case CallCode::retrace_memcpy           :
+        {
+            size_t destination = static_cast<size_t>(call->arg(0).toUInt());
+            auto it = activeRegions_.find(destination);
+            if (it == activeRegions_.cend())
+            {
+                std::cerr << "ERROR: memcpy does not affect resource." << std::endl;
+            }
+            else
+            {
+                MappedRegion const& region = it->second;
+                auto resourceIt = resources_.find(region.parentResource);
+                if (resourceIt == resources_.cend())
+                {
+                    std::cerr << "ERROR: memcpy for nonexistent resource." << std::endl;
+                }
+                else
+                {
+                    resourceIt->second.addCall(std::move(call), ResourceAction::Memcpy);
+                }
+            }
+
+        }
         case CallCode::retrace_IUnknown__AddRef :
         case CallCode::retrace_IUnknown__Release:
         case CallCode::retrace_IUnknown__Release2:
@@ -289,7 +435,18 @@ public:
             break;
         }
         case CallCode::retrace_IDirect3DTexture9__UnlockRect:
-            return; //Possibly have better lineage control for this
+        {
+            auto it = resources_.find(call->arg(0).toUInt());
+            if (it != resources_.cend())
+            {
+                it->second.addCall(std::move(call), ResourceAction::TextureUnlock);
+            }
+            else
+            {
+                std::cerr << "ERROR: trying to lock nonexistant texture." << std::endl;
+            }
+            break;
+        }
         case CallCode::retrace_IDirect3DVertexBuffer9__Lock:
         case CallCode::retrace_IDirect3DVertexBuffer9__Unlock:
         
@@ -334,9 +491,9 @@ public:
     std::vector< std::shared_ptr<trace::Call>> getSquashedCalls() { return {}; }
 
 private:
-    std::map<uint32_t, Resource> resources_;
+    std::map<size_t, Resource> resources_;
 
-    std::map<uint32_t, MappedRegion> activeRegions_;
+    std::map<size_t, MappedRegion> activeRegions_;
 };
 
 

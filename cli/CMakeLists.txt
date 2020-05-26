@@ -19,6 +19,7 @@ include_directories (
     ${CMAKE_SOURCE_DIR}/thirdparty
     ${CMAKE_SOURCE_DIR}/helpers
     ${CMAKE_SOURCE_DIR}/dispatch
+    ${CMAKE_SOURCE_DIR}/retrace
 )
 
 add_executable (apitrace
