@@ -60,6 +60,8 @@ enum class ResourceType
 enum class ResourceAction
 {
     Unknown = 0,
+    AddRef,
+    Release,
     Memcpy,
     TextureLock,
     TextureUnlock,
@@ -141,26 +143,45 @@ private:
     public: 
         Resource(std::unique_ptr<trace::Call> && call,
             std::map<size_t, MappedRegion> *activeRegions,
+            std::map<size_t, Resource> *resources, 
             ResourceType resourceType = ResourceType::Unknown)
             : creation_(std::move(call))
             , activeRegions_(activeRegions)
+            , resources_(resources)
             , resourceType_(resourceType) {}
-
-        void addRef()
-        {
-            refcountCheck();
-
-            ref_count_++;
-        }
-
-        void release()
-        {
-            refcountCheck();
-            ref_count_--;
-        }
 
         void addCall(std::unique_ptr<trace::Call> && call, ResourceAction resourceAction)
         {
+            switch (resourceAction)
+            {
+            case ResourceAction::AddRef:
+            {
+                addref_calls_.emplace_back(std::move(call));
+                return;
+            }
+
+            case ResourceAction::Release:
+            {
+                if (addref_calls_.size() < 1)
+                {
+                    std::cerr << "destroying..." << std::endl;
+                    size_t resourceAddress = static_cast<size_t>(call->arg(0).toUInt());
+                    auto it = resources_->find(resourceAddress);
+                    if (it == resources_->cend())
+                    {
+                        std::cerr << "ERROR: couldn't find self" << std::endl;
+                        return;
+                    }
+
+                    resources_->erase(it);
+                    return;
+                }
+                addref_calls_.pop_back();
+
+            }
+
+            }
+
             switch (resourceType_)
             {
             case ResourceType::Texture:
@@ -176,12 +197,6 @@ private:
         std::vector< std::shared_ptr<trace::Call>> flatten() {
             std::vector< std::shared_ptr<trace::Call>> result;
             
-            refcountCheck();
-
-            if(ref_count_ <= 0)
-            { 
-                return {};
-            }
 
             result.emplace_back(creation_);
 
@@ -194,6 +209,8 @@ private:
             {
                 result.insert(result.end(), m.second.begin(), m.second.end());
             }
+
+            result.insert(result.end(), addref_calls_.begin(), addref_calls_.end());
 
             return result;
         }
@@ -225,14 +242,6 @@ private:
             return 0;
         }
 
-        void refcountCheck()
-        {
-            if (ref_count_ <= 0)
-            {
-                std::cerr << "invalid resource refcount encountered: 0x" 
-                    << std::hex << getResourceAddress() << std::dec << std::endl;
-            }
-        }
 
         MappedRegion textureGetMappedRegionDescriptor(
             trace::Call * textureLockCall)
@@ -286,7 +295,6 @@ private:
             {
             case ResourceAction::TextureLock:
             {
-                ++memory_mapped_region_count_;
                 MappedRegion mappedRegion = textureGetMappedRegionDescriptor(call.get());
                 size_t subresource_index = (call->arg(1)).toUInt();
                 auto sub_staging = staging_modifiers_.find(subresource_index);
@@ -340,7 +348,6 @@ private:
             }
             case ResourceAction::TextureUnlock:
             {
-                --memory_mapped_region_count_;
 
                 size_t subresource_index = (call->arg(1)).toUInt();
                 auto sub_staging = staging_modifiers_.find(subresource_index);
@@ -386,10 +393,6 @@ private:
             }
         }
 
-
-        int ref_count_ = 1;
-
-        int memory_mapped_region_count_ = 0;
         ResourceType const resourceType_;
         std::shared_ptr < trace::Call> const creation_;
 
@@ -398,8 +401,10 @@ private:
 
         std::map<size_t, std::vector< std::shared_ptr<trace::Call>>> staging_modifiers_;
 
+        std::vector < std::shared_ptr<trace::Call>> addref_calls_;
         //
         std::map<size_t, MappedRegion>  * const activeRegions_;
+        std::map<size_t, Resource>  * const resources_;
     };
 
 public:
@@ -433,13 +438,40 @@ public:
                     resourceIt->second.addCall(std::move(call), ResourceAction::Memcpy);
                 }
             }
-
+            break;
         }
         case CallCode::retrace_IUnknown__AddRef :
+        {
+            size_t resourceAddress = static_cast<size_t>(call->arg(0).toUInt());
+            auto it = resources_.find(resourceAddress);
+            if (it != resources_.cend())
+            {
+                it->second.addCall(std::move(call), ResourceAction::AddRef);
+                return true;
+            }
+            else
+            {
+                std::cerr << "ERROR: trying to lock nonexistant texture." << std::endl;
+            }
+            break;
+        }
         case CallCode::retrace_IUnknown__Release:
         case CallCode::retrace_IUnknown__Release2:
         case CallCode::retrace_IUnknown__Release3:
-
+        {
+            size_t resourceAddress = static_cast<size_t>(call->arg(0).toUInt());
+            auto it = resources_.find(resourceAddress);
+            if (it != resources_.cend())
+            {
+                it->second.addCall(std::move(call), ResourceAction::Release);
+                return true;
+            }
+            else
+            {
+                std::cerr << "ERROR: trying to lock nonexistant texture." << std::endl;
+            }
+            break;
+        }
         case CallCode::retrace_IUnknown__QueryInterface:
 
         case CallCode::retrace_IDirect3DTexture9__GetSurfaceLevel:
@@ -489,7 +521,7 @@ public:
 
             size_t key = static_cast<size_t>(ppTexture->values[0]->toUInt());
             auto[_, success_inserted] = resources_.emplace(key,
-                Resource(std::move(call), &activeRegions_,  ResourceType::Texture));
+                Resource(std::move(call), &activeRegions_, &resources_, ResourceType::Texture));
             if (!success_inserted)
             {
                 std::cerr << "ERROR: texture already created." << std::endl;
@@ -691,6 +723,14 @@ trim_trace(const char *filename, struct trim_options *options)
             (options->frames.empty() || frame > options->frames.getLast())) {
 
             break;
+        }
+
+        while(nonNullCalls.size() && call_index > nonNullCalls.back()->no)
+        {
+            
+            auto unused = nonNullCalls.back();
+            std::cerr << "error: unused call " << unused->no << std::endl;
+            nonNullCalls.pop_back();
         }
 
         /* If requested, ignore all calls not belonging to the specified thread. */
