@@ -24,6 +24,7 @@
  *
  **************************************************************************/
 
+#include <algorithm>
 #include <set>
 #include <sstream>
 #include <string>
@@ -47,7 +48,7 @@
 #include "trace_callset.hpp"
 #include "trace_parser.hpp"
 #include "trace_writer.hpp"
-
+#pragma optimize( "", off )
 
 //TODO: Find new home
 enum class ResourceType
@@ -189,6 +190,11 @@ private:
                 result.insert(result.end(), m.second.begin(), m.second.end() );
             }
 
+            for (auto& m : staging_modifiers_)
+            {
+                result.insert(result.end(), m.second.begin(), m.second.end());
+            }
+
             return result;
         }
 
@@ -201,12 +207,22 @@ private:
             switch (resourceType_)
             {
             case ResourceType::Texture:
-                return static_cast<size_t>(creation_->arg(7).toUInt());
-            
+            {
+                const trace::Array * ppTexture = creation_->arg(7).toArray();
+                if (!ppTexture)
+                {
+                    std::cerr << "ERROR: could not get texture address" << std::endl;
+                    break;
+                }
+
+                return static_cast<size_t>(ppTexture->values[0]->toUInt());
+            }
+                
             default:
                 std::cerr << "invalid resource type" << std::endl;
-                return 0;
+                
             }
+            return 0;
         }
 
         void refcountCheck()
@@ -221,21 +237,28 @@ private:
         MappedRegion textureGetMappedRegionDescriptor(
             trace::Call * textureLockCall)
         {
-            retrace::ScopedAllocator _allocator;
-            D3DLOCKED_RECT * pLockedRect;
-            pLockedRect = _allocator.allocArray<D3DLOCKED_RECT>(&textureLockCall->arg(2));
-
+            D3DLOCKED_RECT lockedRect{0};
+            trace::Array const* pLockedRect = textureLockCall->arg(2).toArray();
+            if (pLockedRect)
+            {
+                const trace::Struct *_struct = pLockedRect->values[0]->toStruct();
+                if (_struct)
+                {
+                    lockedRect.Pitch = _struct->members[0]->toUInt();
+                    lockedRect.pBits = reinterpret_cast<void*>(_struct->members[1]->toUInt());
+                }
+            }
             //  \retrace\d3dretrace_d3d9.cpp:1039
-            RECT * pRect;
-            pRect = _allocator.allocArray<RECT>(&textureLockCall->arg(3));
+            RECT rect{ 0 };
+            
+             const trace::Array *pRect = (textureLockCall->arg(3)).toArray();
             if (pRect) {
-                const trace::Array *_a_PRECT5_0 = (textureLockCall->arg(3)).toArray();
-                const trace::Struct *_s_RECT_1 = (*_a_PRECT5_0->values[0]).toStruct();
+                const trace::Struct *_s_RECT_1 = (*pRect->values[0]).toStruct();
                 assert(_s_RECT_1);
-                (pRect[0]).left = (*_s_RECT_1->members[0]).toSInt();
-                (pRect[0]).top = (*_s_RECT_1->members[1]).toSInt();
-                (pRect[0]).right = (*_s_RECT_1->members[2]).toSInt();
-                (pRect[0]).bottom = (*_s_RECT_1->members[3]).toSInt();
+                rect.left = (*_s_RECT_1->members[0]).toSInt();
+                rect.top = (*_s_RECT_1->members[1]).toSInt();
+                rect.right = (*_s_RECT_1->members[2]).toSInt();
+                rect.bottom = (*_s_RECT_1->members[3]).toSInt();
             }
 
             UINT Width;
@@ -243,16 +266,16 @@ private:
             D3DFORMAT Format;
             Format = static_cast<D3DFORMAT>((creation_->arg(5)).toSInt());
             if (pRect) {
-                Width = pRect->right - pRect->left;
-                Height = pRect->bottom - pRect->top;
+                Width = rect.right - rect.left;
+                Height = rect.bottom - rect.top;
             }
             else {
                 Width = (creation_->arg(1)).toUInt();
                 Height = (creation_->arg(2)).toUInt();
             }
 
-            size_t size = _getLockSize(Format, pRect, Width, Height, pLockedRect->Pitch);
-            return MappedRegion{ reinterpret_cast<size_t>(pLockedRect->pBits),   
+            size_t size = _getLockSize(Format, pRect, Width, Height, lockedRect.Pitch);
+            return MappedRegion{ reinterpret_cast<size_t>(lockedRect.pBits),   
                 size,  static_cast<size_t>(textureLockCall->arg(0).toUInt()), 
                 static_cast<size_t>(textureLockCall->arg(1).toUInt()) };
         }
@@ -384,7 +407,7 @@ public:
 
     D3D9StateAggregator() {}
 
-    void addCall(std::unique_ptr<trace::Call> && call) {
+    bool addCall(std::unique_ptr<trace::Call> && call) {
         CallCode const call_code = static_cast<CallCode>(call->sig->id);
         switch (call_code)
         {
@@ -420,10 +443,11 @@ public:
         case CallCode::retrace_IUnknown__QueryInterface:
 
         case CallCode::retrace_IDirect3DTexture9__GetSurfaceLevel:
-
+            return false;
         case CallCode::retrace_IDirect3DTexture9__LockRect:
         {
-            auto it = resources_.find(call->arg(0).toUInt());
+            size_t textureAddress = static_cast<size_t>(call->arg(0).toUInt());
+            auto it = resources_.find(textureAddress);
             if (it != resources_.cend())
             {
                 it->second.addCall(std::move(call), ResourceAction::TextureLock);
@@ -432,7 +456,7 @@ public:
             {
                 std::cerr << "ERROR: trying to lock nonexistant texture." << std::endl;
             }
-            break;
+            return true;
         }
         case CallCode::retrace_IDirect3DTexture9__UnlockRect:
         {
@@ -445,7 +469,7 @@ public:
             {
                 std::cerr << "ERROR: trying to lock nonexistant texture." << std::endl;
             }
-            break;
+            return true;
         }
         case CallCode::retrace_IDirect3DVertexBuffer9__Lock:
         case CallCode::retrace_IDirect3DVertexBuffer9__Unlock:
@@ -453,15 +477,24 @@ public:
         case CallCode::retrace_IDirect3DDevice9__TestCooperativeLevel:
         case CallCode::retrace_IDirect3DDevice9__GetDirect3D:
         case CallCode::retrace_IDirect3DDevice9__Present:
+            return false;
         case CallCode::retrace_IDirect3DDevice9__CreateTexture:
         {
-            auto[_, success_inserted] = resources_.emplace(call->arg(7).toUInt(), 
+            const trace::Array * ppTexture = call->arg(7).toArray();
+            if (!ppTexture)
+            {
+                std::cerr << "ERROR: texture creation returned null" << std::endl;
+                break;
+            }
+
+            size_t key = static_cast<size_t>(ppTexture->values[0]->toUInt());
+            auto[_, success_inserted] = resources_.emplace(key,
                 Resource(std::move(call), &activeRegions_,  ResourceType::Texture));
             if (!success_inserted)
             {
                 std::cerr << "ERROR: texture already created." << std::endl;
             }
-            break;
+            return true;
         }
         case CallCode::retrace_IDirect3DDevice9__CreateVertexBuffer     :
         case CallCode::retrace_IDirect3DDevice9__SetViewport            :
@@ -483,12 +516,23 @@ public:
 
         
         default:
-            break;
+            return false;
         }
-    
+        return false;
     }
 
-    std::vector< std::shared_ptr<trace::Call>> getSquashedCalls() { return {}; }
+    std::vector< std::shared_ptr<trace::Call>> getSquashedCalls() 
+    { 
+        std::vector< std::shared_ptr<trace::Call>> aggregate;
+        for(auto& pair : resources_)
+        { 
+            std::vector< std::shared_ptr<trace::Call>> result = pair.second.flatten();
+            aggregate.insert(aggregate.end(),
+                std::make_move_iterator(result.begin()),
+                std::make_move_iterator(result.end()));
+        }
+        return aggregate;
+    }
 
 private:
     std::map<size_t, Resource> resources_;
@@ -603,9 +647,11 @@ trim_trace(const char *filename, struct trim_options *options)
     frame = 0;
     std::unique_ptr<trace::Call> call;
 
+    trace::ParseBookmark bookmark{0};
+    p.getBookmark(bookmark);
 
     const unsigned int squash_until_frame = options->squash_until_frame;
-    
+    std::vector<bool> contenderCallsNotNeeded;
     while (frame < squash_until_frame) {
         call = std::unique_ptr<trace::Call>(p.parse_call());
         if (!call)
@@ -614,21 +660,31 @@ trim_trace(const char *filename, struct trim_options *options)
         }
         
         trace::CallFlags const& call_flags = call->flags;
-        state_aggregator.addCall(std::move(call));
+        contenderCallsNotNeeded.push_back(state_aggregator.addCall(std::move(call)));
         if (call_flags & trace::CALL_FLAG_END_FRAME) {
             frame++;
         }
     }
 
-    for (auto& squash_call : state_aggregator.getSquashedCalls())
-    {
-        writer.writeCall(squash_call.get());
-    }
+    std::vector<std::shared_ptr<trace::Call>> aggregateCalls = state_aggregator.getSquashedCalls();
 
+    std::vector<std::shared_ptr<trace::Call>> nonNullCalls;
+    nonNullCalls.reserve(aggregateCalls.size());
+
+    std::copy_if(aggregateCalls.begin(), aggregateCalls.end(),
+        std::back_inserter(nonNullCalls), [](std::shared_ptr<trace::Call> const& aCall) { return aCall.operator bool(); });
+
+    //Sort in descending order
+    std::sort(nonNullCalls.begin(), nonNullCalls.end(), 
+        [](std::shared_ptr<trace::Call> const& lhs, std::shared_ptr<trace::Call> const& rhs) {return lhs->no > rhs->no; });
+
+    p.setBookmark(bookmark);
+    frame = 0;
+    int call_index = -1;
 
     while ((call = std::unique_ptr<trace::Call>(p.parse_call()))) {
         trace::CallFlags const& call_flags = call->flags;
-
+        ++call_index;
         /* There's no use doing any work past the last call and frame
          * requested by the user. */
         if ((options->calls.empty() || call->no > options->calls.getLast()) &&
@@ -643,13 +699,32 @@ trim_trace(const char *filename, struct trim_options *options)
             goto NEXT;
         }
 
+        bool okToWrite = true;
+
+        if (call_index < contenderCallsNotNeeded.size() 
+            && contenderCallsNotNeeded[call_index] && nonNullCalls.size() > 0)
+        {
+            if (call->no < nonNullCalls.back()->no)
+            {
+                okToWrite = false;
+            }
+            else if (call->no == nonNullCalls.back()->no)
+            {
+                nonNullCalls.pop_back();
+            }
+        }
+
         /* If this call is included in the user-specified call set,
          * then require it (and all dependencies) in the trimmed
          * output. */
         if (options->calls.contains(*call) ||
             options->frames.contains(frame, call_flags)) {
 
-            writer.writeCall(call.get());
+            if (okToWrite)
+            {
+                writer.writeCall(call.get());
+            }
+            
         }
 
     NEXT:
@@ -658,6 +733,8 @@ trim_trace(const char *filename, struct trim_options *options)
         }
 
     }
+
+    std::cout << nonNullCalls.size() << "remaining." << std::endl;
 
     std::cerr << "Trimmed trace is available as " << options->output << "\n";
 
@@ -724,6 +801,8 @@ command(int argc, char *argv[])
 
     return trim_trace(argv[optind], &options);
 }
+
+#pragma optimize( "", on )
 
 const Command trim_command = {
     "trim",
